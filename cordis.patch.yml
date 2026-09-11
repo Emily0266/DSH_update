@@ -1,0 +1,5 @@
+# dsh-version-panel 的 bundle patch：把本插件插入 profile 的层栈。
+# 由 package.json 的 dsh.bundle.patch 引用。
+- insert:
+    - id: dsh-version-panel
+      name: 'dsh-version-panel'
