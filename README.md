@@ -119,7 +119,7 @@ pnpm dsh web
    | --- | --- |
    | `preflight` | 记录基线 `HEAD`、收集 `git status --porcelain`；未跟踪条目仅记录；受跟踪改动**只允许落在受管补丁触及的路径上**，否则直接拒绝并点名文件 |
    | 暂退受管补丁 | 逐个对补丁做 `git apply --reverse --check`：逐字命中就 `git apply --reverse` 把这块工作区改动退回干净状态，**为 pull 让路**（补丁文件本身就是这些改动的权威副本，所以不算丢东西）。任何无法归属到补丁的受跟踪改动都会中止更新，并把已暂退的补丁**原样恢复**回工作区 |
-   | `git pull --ff-only` | 快进拉取上游；失败时把暂退的补丁原样恢复回工作区，工作区回到更新前的样子 |
+   | `git pull --ff-only` | 快进拉取上游；fetch 失败但本地已有更新的 `origin/master` 时，**自动改用本地离线快进**并在进度里显著标注（可能不是此刻的最新提交）；否则中止更新，并把暂退的补丁原样恢复回工作区 |
    | 重放受管本地补丁 | 逐个处理补丁目录里的 `NNNN-*.patch`；`git apply --reverse --check` 通过 ⇒ 判定「已上游化」并跳过；否则 `git apply --3way`，冲突则中止整个更新并列出冲突文件 |
    | `corepack pnpm install` | 用 corepack 解析出的 pnpm（`packageManager` 版本）安装依赖 |
    | `corepack pnpm run build` | 唯一规范构建入口（`scripts/build.ts`）：删构建记录 → `build:native-system` → `build:lib` → `build:web` → 写回记录 |
@@ -194,7 +194,7 @@ host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
 }
 ```
 
-`POST { "action": "progress" }` 与 `GET` 里的 `update` 字段形状一致，除既有字段外还包含：`baseCommit`、`patches`（逐补丁的 `已上游化` / `已应用` / `冲突`）、`patchDir`、`revertedPatches`（已暂退、尚未重放或恢复的补丁）、`restoreReport`（回滚时把暂退补丁恢复回工作区的结果）、`packageManager`、`guidance`（回滚指引）、`currentStep`、`failure`、`smoke`。每个 step 记录在既有的 `name/status/code/error/lines` 之外追加 `tail`（最后 40 行真实输出）、`timedOut`、`outputLines`、`durationMs`，暂退步骤还带 `reverted` / `restored`。
+`POST { "action": "progress" }` 与 `GET` 里的 `update` 字段形状一致，除既有字段外还包含：`baseCommit`、`patches`（逐补丁的 `已上游化` / `已应用` / `冲突`）、`patchDir`、`revertedPatches`（已暂退、尚未重放或恢复的补丁）、`restoreReport`（回滚时把暂退补丁恢复回工作区的结果）、`offlineFallback`（本次是否用了「连不上上游 ⇒ 本地快进」兜底）、`packageManager`、`guidance`（回滚指引）、`currentStep`、`failure`、`smoke`。每个 step 记录在既有的 `name/status/code/error/lines` 之外追加 `tail`（最后 40 行真实输出）、`timedOut`、`outputLines`、`durationMs`，暂退步骤还带 `reverted` / `restored`，pull 步骤还可能带 `offlineFallback`。
 
 ## 工作原理
 
@@ -254,6 +254,17 @@ dsh plugin --profile web add github:Emily0266/DSH_update
 # 若失败，可先在临时目录用带代理的 git 克隆，再以本地路径安装
 ```
 
+### 本地更新报「unable to access 'https://github.com/...' / Connection was reset」
+
+`git pull` 的第一步是 fetch，GitHub 不可达时它就先失败了。插件对此的处理：
+
+- **本地已经 fetch 到更新的 `origin/master`**（上一次拉取成功过）⇒ 自动改用**离线快进**（`git merge --ff-only origin/master`），更新继续走完 install/build，并在进度卡片与 `offlineFallback` 字段上标注「本次没和上游重新校验，可能不是此刻的最新提交」；
+- **本地没有可快进的目标** ⇒ 中止更新，工作区（含暂退的补丁）保持更新前的样子，不会留下半成品。
+
+想彻底解决就恢复 GitHub 可达性（配置 `http.proxy` / 开代理），然后重开一次更新；`git fetch` 成功过一次后，即使随后 GitHub 又断，也能靠离线快进完成。
+
+> 不要用 `gitclone.com` 这类镜像当上游：实测它的 `master` 仍停在 `dsh-0.1.2-alpha.4`，比真实上游落后很多。镜像只适合加速首次克隆。
+
 ### 没有「一键本地更新」按钮
 
 该按钮仅在识别到 **git 源码仓库**时出现。若 DSH 来自 npm 包安装，请使用 `npm install -g @deepseek-ai/dsh@<版本>` 之类的方式升级。
@@ -267,6 +278,7 @@ dsh plugin --profile web add github:Emily0266/DSH_update
 - **更新仅支持 git 源码仓库**：npm 全局安装或 npx 缓存运行的环境不提供一键更新。
 - **需要重启生效**：无论一键更新还是手动更新，完成后都必须重启 `dsh web`。
 - **上游检查依赖 GitHub 可达性**：网络受限环境下需要代理。
+- **离线快进可能不是最新提交**：连不上上游时若本地已有更新的 `origin/master`，插件会用它快进并在界面标注；网络恢复后请重新检查更新。
 - **本地更新不做分支校验**：使用 `git pull --ff-only`，若本地有分叉提交会失败并保留原状。
 - **冒烟自检是 best-effort**：临时 `DSH_HOME` 里的 profile 依赖真实 profile 的 `node_modules`；找不到 profile 或无法启动时只记录原因并继续，不阻塞更新。超时按告警处理。
 - **产物校验只查存在性**：构建记录的 SHA-256 摘要逻辑仍由 DSH 自己的构建负责，插件只检查存在性 + `formatVersion === 1`。
