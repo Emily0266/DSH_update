@@ -29,6 +29,11 @@ DSH 的 Web 界面本身没有版本查看入口，源码部署时更难确认�
 | **当前版本** | 从真实运行入口（`process.argv[1]`）向上定位 `package.json`。**源码部署**（`pnpm dsh web` → `apps/cli/src/bin.ts`）同样能读到正确版本，不依赖 `dsh --version` 是否在 `PATH` 上 |
 | **上游最新版本** | 读取 GitHub releases，失败自动回退 tags，并在候选里取**最大语义化版本**（正确处理 `rc` / `alpha` 等预发布后缀） |
 | **本地更新** | 仅对 git 源码仓库开放，按 `preflight` → 暂退受管补丁 → `git pull --ff-only` → 重放受管补丁 → `corepack pnpm install` → `corepack pnpm run build` → 产物校验 → 隔离冒烟自检 顺序执行，**分步实时进度** |
+| **空闲检查** | 更新前检查宿主是否有会话正在运行；有则拒绝启动（可用 `force: true` 覆盖）。运行中替换 `node_modules` 与构建产物会让宿主加载到「换过之后」的模块，可能打断正在执行的工具调用 |
+| **自动重启** | 更新成功后由脱离进程的 helper 等宿主端口释放后自动拉起 `dsh web`，避免用户继续使用模块已被替换的进程；在 systemd 监管或调试器下自动禁用（可用 `allowRestart` 覆盖） |
+| **失败回滚** | 更新失败后可从面板一键回滚到更新前的基线提交：`git reset --hard <base>` → 重放受管补丁 → 重装 → 重建。基线提交持久化在 DSH home，跨宿主重启仍可回滚 |
+| **并发锁** | 仓库 `.git` 下的跨进程锁：另一个宿主/进程正在更新同一仓库时拒绝启动；持锁进程已死会自动清理过期锁 |
+| **运行 vs 磁盘版本** | 显示运行进程启动时的提交与启动时间，并与磁盘 HEAD 对比，标出「重启未生效」 |
 | **规范构建** | 走仓库唯一的规范入口 `pnpm run build`（`scripts/build.ts`），它还会先删构建记录、跑 `build:native-system`、最后写回记录，避免只跑 `build:lib` / `build:web` 导致的客户端 bundle 缺失 |
 | **包管理器把关** | 统一走 `corepack pnpm`（解析到 `package.json` 声明的版本）；解析不到时回退 `npx -y pnpm@<版本>`；两者都拿不到声明版本则**拒绝更新** |
 | **产物校验** | 遍历 `packages/*/*/package.json`，凡声明 `exports['./client']` 者断言其 `default`（或 `types`）文件存在，缺失逐个点名「包名 + 期望路径」 |
@@ -125,9 +130,10 @@ pnpm dsh web
    | `corepack pnpm run build` | 唯一规范构建入口（`scripts/build.ts`）：删构建记录 → `build:native-system` → `build:lib` → `build:web` → 写回记录 |
    | 产物校验 | 客户端 bundle 存在性 + 构建记录存在性与 `formatVersion === 1` |
    | 隔离冒烟自检 | 临时 `DSH_HOME` + 相同 bundles + `--port 0` 独立启动一次，观测到「已在 127.0.0.1:<port> 监听」即通过 |
+   | 自动重启 | 成功后安排宿主自重启（默认 2.5s 缓冲，留出时间让页面取到最终状态）；不允许自重启的环境会提示手动重启 |
 
 3. 每步的实时输出（末尾若干行）显示在进度卡片中，失败步骤会额外保留**最后 40 行真实输出**；
-4. 全部完成后提示：**请重启 `dsh web` 使新版本生效**；
+4. 全部完成后：允许自重启的环境会自动安排宿主重启（页面稍后自动刷新）；不允许的环境提示 **请重启 `dsh web` 使新版本生效**；
 5. 任一步失败都会给出「哪一步 / 退出码 / 输出尾部 / 回滚指引（基线 commit + 重装 + 重建命令）」。
 
 > ⚠️ 该操作会**真实修改源码目录**。不打算升级时请不要点击，只用它查看版本即可。
@@ -149,6 +155,54 @@ pnpm dsh web
 
 注意：手工执行时若工作区里还留着受管补丁的改动，`git pull --ff-only` 会因为「本地改动会被覆盖」失败。先用 `git stash push -- <补丁覆盖的路径>` 把这块改动收起来，pull 完再 `git stash pop`（或改用面板的一键更新，它会自动完成「暂退 → pull → 重放」）。
 
+### 空闲检查与自重启
+
+面板作为插件运行在**正在服务的宿主进程内**，而本地更新会重链 `node_modules`、重写 `packages/*/lib/*.js`。如果更新期间宿主里有会话正在执行工具调用，运行中的进程随后加载到「换过之后」的模块就会出现同一模块两个实例，破坏服务符号（典型现象：`ctx.tools[TOOL_RUNTIME_SCHEDULER]` 变 `undefined`，工具调用报 `Cannot read properties of undefined (reading 'prepare')`）。因此面板：
+
+- **更新前**要求宿主空闲：`ctx.agents.list()` 里有 `status === 'running'` 的会话时拒绝启动更新（HTTP 409），界面上的「一键本地更新」也会置灰并说明原因。确需在运行中更新时，API 可传 `"force": true`。
+- **更新成功后**自动重启宿主：由一个脱离进程的 helper 等宿主端口真正释放后，重放原始启动命令拉起 `dsh web`（Windows 下用隐藏控制台包装，避免替换进程的控制台子进程弹窗）。helper 日志写在系统临时目录（`dsh-version-panel-restart-*.log`），失败会留证。
+
+自重启在以下情况自动禁用（此时界面提示手动重启）：
+
+| 情况 | 原因 |
+| --- | --- |
+| systemd 等监管器 | 监管器拥有重启，且其进程组会连带杀掉 detached helper |
+| 宿主运行在调试器下（`--inspect` 等） | 重启会打断调试会话 |
+| 配置 `allowRestart: false` | 显式关闭 |
+
+### 失败回滚
+
+更新（或回滚）失败后，面板会出现「上次更新失败 / 可回滚」卡片，点「回滚到更新前」即按以下顺序执行：
+
+| 步骤 | 说明 |
+| --- | --- |
+| `git reset --hard <baseCommit>` | 回到本次更新开始前记录的基线提交。只影响受跟踪文件；受管补丁的工作区改动会随之清掉，下一步重放 |
+| 重放受管本地补丁 | 与更新流程同一套逻辑（已上游化则跳过） |
+| `corepack pnpm install` → `pnpm run build` | 重装依赖并重建（`pnpm install` 可能已被上次失败改坏） |
+| 产物校验 + 隔离冒烟自检 | 与更新一致 |
+| 自动重启 | 成功后同样走自重启 |
+
+基线提交存在 `$DSH_HOME/version-panel-state.json`（`lastRun.baseCommit`），所以**宿主重启后仍能回滚**。回滚同样要求宿主空闲、需要 `confirm: true`、走跨进程锁，并仅接受本机同源请求。
+
+> ⚠ `git reset --hard` 会丢弃仓库里所有**受跟踪**的未提交改动。正常更新流程的 preflight 已保证这类改动只可能是受管补丁（会被重放），但如果你在更新失败后手工改过仓库文件，回滚前请先自行备份。
+
+### 并发锁与运行版本
+
+- **跨进程锁**：锁文件默认是 `<repo>/.git/dsh-version-panel.lock`（`.git` 不是目录时退回到 DSH home 旁）。它覆盖「两个 `dsh web` 实例」或「面板与 `dsh plugin` 命令行同时操作同一仓库」的竞态；持锁进程已死时锁会被自动清理。
+- **运行 vs 磁盘**：面板显示「运行进程」的启动提交与启动时间，并与「磁盘 HEAD」对比。两者不一致说明磁盘已更新但宿主没重启，界面会标出「重启未生效」。
+
+### 配置
+
+在 profile 的 `cordis.patch.yml` 里给本插件行加配置即可（默认值见下）：
+
+```yaml
+- id: dsh-version-panel
+  config:
+    autoRestart: true      # 更新成功后自动重启；false 则只提示手动重启
+    allowRestart: true     # 覆盖监管/调试检测；仅在部署能拉起替换进程时使用
+    restartDelayMs: 2500   # 自动重启前的缓冲毫秒数（给页面取最终状态留时间）
+```
+
 ## HTTP 接口
 
 host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
@@ -158,7 +212,9 @@ host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
 | `GET` | — | 读取状态（当前版本 + 上游版本，带缓存）。可加 `?force=1` 跳过缓存 |
 | `POST` | `{ "action": "check" }` | 强制重新检查上游 |
 | `POST` | `{ "action": "progress" }` | 读取更新进度 |
-| `POST` | `{ "action": "update", "confirm": true }` | 启动本地更新（缺少 `confirm` 会被拒绝） |
+| `POST` | `{ "action": "update", "confirm": true }` | 启动本地更新（缺少 `confirm` 会被拒绝；宿主有会话运行时返回 409，可加 `"force": true` 覆盖） |
+| `POST` | `{ "action": "restart" }` | 安排宿主自重启（仅接受本机同源请求；监管/调试器/`allowRestart: false` 下返回 409） |
+| `POST` | `{ "action": "rollback", "confirm": true }` | 回滚到最近一次更新的基线提交（可用 `baseCommit` 覆盖）。需 `confirm: true`、仅本机同源、宿主空闲；跨进程锁被占用时返回 409 |
 
 `GET` 响应示例：
 
@@ -189,6 +245,37 @@ host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
     "lastBuildIncomplete": false,
     "smoke": null,
     "warnings": []
+  },
+  "hostBusy": false,
+  "hostRunning": [],
+  "hostActivityKnown": true,
+  "host": {
+    "pid": 12345,
+    "startedAt": 1789700000000,
+    "bootCommit": "ddefc45fbc7f8e46dd73185e68295696d1297887",
+    "diskCommit": "ddefc45fbc7f8e46dd73185e68295696d1297887",
+    "stale": false
+  },
+  "lastRun": {
+    "kind": "update",
+    "repoRoot": "D:\\deepseek-harness",
+    "baseCommit": "ddefc45fbc7f8e46dd73185e68295696d1297887",
+    "ok": false,
+    "startedAt": 1789700000000,
+    "endedAt": 1789700100000,
+    "failureStep": "corepack pnpm run build",
+    "pulled": true
+  },
+  "restart": {
+    "allowed": true,
+    "scheduled": false,
+    "auto": false,
+    "at": null,
+    "pid": null,
+    "helperPid": null,
+    "logOut": null,
+    "logErr": null,
+    "reason": null
   },
   "checkedAt": "2026-09-11T12:00:00.000Z"
 }
@@ -276,7 +363,8 @@ dsh plugin --profile web add github:Emily0266/DSH_update
 ## 已知限制
 
 - **更新仅支持 git 源码仓库**：npm 全局安装或 npx 缓存运行的环境不提供一键更新。
-- **需要重启生效**：无论一键更新还是手动更新，完成后都必须重启 `dsh web`。
+- **需要重启生效**：一键更新成功后会自动安排宿主重启；手动更新、或自动重启被禁用（监管/调试器/`allowRestart: false`）时，仍需自行重启 `dsh web`。
+- **自重启不是所有环境都可用**：systemd 等监管器下、或宿主运行在调试器下时自动禁用（监管器负责重启）。可用 `allowRestart: true` 显式覆盖监管检测（前提是你的部署能在宿主退出后把替换进程拉起来）。
 - **上游检查依赖 GitHub 可达性**：网络受限环境下需要代理。
 - **离线快进可能不是最新提交**：连不上上游时若本地已有更新的 `origin/master`，插件会用它快进并在界面标注；网络恢复后请重新检查更新。
 - **本地更新不做分支校验**：使用 `git pull --ff-only`，若本地有分叉提交会失败并保留原状。
