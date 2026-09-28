@@ -28,10 +28,12 @@ DSH 的 Web 界面本身没有版本查看入口，源码部署时更难确认�
 | --- | --- |
 | **当前版本** | 从真实运行入口（`process.argv[1]`）向上定位 `package.json`。**源码部署**（`pnpm dsh web` → `apps/cli/src/bin.ts`）同样能读到正确版本，不依赖 `dsh --version` 是否在 `PATH` 上 |
 | **上游最新版本** | 读取 GitHub releases，失败自动回退 tags，并在候选里取**最大语义化版本**（正确处理 `rc` / `alpha` 等预发布后缀） |
-| **本地更新** | 仅对 git 源码仓库开放，按 `preflight` → 暂退受管补丁 → `git pull --ff-only` → 重放受管补丁 → `corepack pnpm install` → `corepack pnpm run build` → 产物校验 → 隔离冒烟自检 顺序执行，**分步实时进度** |
+| **本地更新** | 仅对 git 源码仓库开放，按 `preflight` → 暂退受管补丁 → `git pull --ff-only` → 重放受管补丁 → `corepack pnpm install` → `corepack pnpm run clean` → `corepack pnpm run build` → 产物校验 → 隔离冒烟自检 顺序执行，**分步实时进度** |
 | **空闲检查** | 更新前检查宿主是否有会话正在运行；有则拒绝启动（可用 `force: true` 覆盖）。运行中替换 `node_modules` 与构建产物会让宿主加载到「换过之后」的模块，可能打断正在执行的工具调用 |
 | **自动重启** | 更新成功后由脱离进程的 helper 等宿主端口释放后自动拉起 `dsh web`，避免用户继续使用模块已被替换的进程；在 systemd 监管或调试器下自动禁用（可用 `allowRestart` 覆盖） |
 | **失败回滚** | 更新失败后可从面板一键回滚到更新前的基线提交：`git reset --hard <base>` → 重放受管补丁 → 重装 → 重建。基线提交持久化在 DSH home，跨宿主重启仍可回滚 |
+| **补丁冲突自恢复** | `git pull` 之后补丁重放冲突时，**自动**把工作区恢复到更新前的基线提交并重放补丁，使工作区与现有构建产物一致（`install`/`build` 尚未运行，无需重建），保证宿主仍可启动；冲突文件逐个列出待修。不会再留下「新上游 + 未构建、起不来」的状态 |
+| **构建前清理** | 构建前先跑 `pnpm run clean`（该脚本缺失时忽略），避免 pull 后的新源码与上一次构建的旧 `lib/` 混杂导致 `MISSING_EXPORT` 之类的构建失败 |
 | **并发锁** | 仓库 `.git` 下的跨进程锁：另一个宿主/进程正在更新同一仓库时拒绝启动；持锁进程已死会自动清理过期锁 |
 | **运行 vs 磁盘版本** | 显示运行进程启动时的提交与启动时间，并与磁盘 HEAD 对比，标出「重启未生效」 |
 | **规范构建** | 走仓库唯一的规范入口 `pnpm run build`（`scripts/build.ts`），它还会先删构建记录、跑 `build:native-system`、最后写回记录，避免只跑 `build:lib` / `build:web` 导致的客户端 bundle 缺失 |
@@ -123,10 +125,11 @@ pnpm dsh web
    | 步骤 | 说明 |
    | --- | --- |
    | `preflight` | 记录基线 `HEAD`、收集 `git status --porcelain`；未跟踪条目仅记录；受跟踪改动**只允许落在受管补丁触及的路径上**，否则直接拒绝并点名文件 |
-   | 暂退受管补丁 | 逐个对补丁做 `git apply --reverse --check`：逐字命中就 `git apply --reverse` 把这块工作区改动退回干净状态，**为 pull 让路**（补丁文件本身就是这些改动的权威副本，所以不算丢东西）。任何无法归属到补丁的受跟踪改动都会中止更新，并把已暂退的补丁**原样恢复**回工作区 |
+   | 暂退受管补丁 | 逐个对补丁做 `git apply --reverse --check`：逐字命中就 `git apply --reverse` 把这块工作区改动退回干净状态，**为 pull 让路**（补丁文件本身就是这些改动的权威副本，所以不算丢东西）。改动若还被 `git add` 过（索引里也有一份），再用 `git apply --reverse --cached` 把索引里那一份也退掉，否则 `git status` 会一直报 `MM` 而被误判成「无法归属」。任何无法归属到补丁的受跟踪改动都会中止更新，并把已暂退的补丁**原样恢复**回工作区 |
    | `git pull --ff-only` | 快进拉取上游；fetch 失败但本地已有更新的 `origin/master` 时，**自动改用本地离线快进**并在进度里显著标注（可能不是此刻的最新提交）；否则中止更新，并把暂退的补丁原样恢复回工作区 |
-   | 重放受管本地补丁 | 逐个处理补丁目录里的 `NNNN-*.patch`；`git apply --reverse --check` 通过 ⇒ 判定「已上游化」并跳过；否则 `git apply --3way`，冲突则中止整个更新并列出冲突文件 |
+   | 重放受管本地补丁 | 逐个处理补丁目录里的 `NNNN-*.patch`；`git apply --reverse --check` 通过 ⇒ 判定「已上游化」并跳过；否则 `git apply --3way`，冲突则中止更新并**自动恢复到基线提交 + 重放补丁**（保证宿主仍可启动），逐个列出冲突文件 |
    | `corepack pnpm install` | 用 corepack 解析出的 pnpm（`packageManager` 版本）安装依赖 |
+   | `corepack pnpm run clean` | 清理旧构建产物（`scripts/clean.ts`；缺失时忽略）。pull 后新源码与旧 `lib/` 混杂会引发 `MISSING_EXPORT` 等构建失败，规范构建本身不清理 |
    | `corepack pnpm run build` | 唯一规范构建入口（`scripts/build.ts`）：删构建记录 → `build:native-system` → `build:lib` → `build:web` → 写回记录 |
    | 产物校验 | 客户端 bundle 存在性 + 构建记录存在性与 `formatVersion === 1` |
    | 隔离冒烟自检 | 临时 `DSH_HOME` + 相同 bundles + `--port 0` 独立启动一次，观测到「已在 127.0.0.1:<port> 监听」即通过 |
@@ -146,8 +149,12 @@ pnpm dsh web
 - preflight 需要的「受管路径集合」直接由补丁头部的 `+++ b/<path>` / `--- a/<path>` 解析得出，不依赖 git 自省；
 - **pull 前先暂退**：补丁覆盖的文件若带着未提交改动，`git pull --ff-only` 会被 git 以「本地改动会被覆盖」为由直接拒绝 —— 只要上游这次更新碰到补丁覆盖的文件，更新就一步也走不成（这正是「暂退受管补丁」这一步存在的原因）。插件会先把与某个补丁逐字一致的改动反向应用掉，pull 成功后再重放；
 - **只动能被证明属于补丁的改动**：`git apply --reverse --check` 不通过的受跟踪改动一律不碰，直接中止并点名；中止或 pull 失败时，已暂退的补丁会原样恢复回工作区，本地工作不会因为一次失败的更新而消失；
+- **索引里的副本也一并退掉**：补丁改动若被 `git add` 过，它会同时存在于索引与工作区，只退工作区会留下 `MM` 死结。插件先用 `git diff --cached --numstat` 确认该补丁路径上确实有暂存改动（已上游化的补丁索引 == HEAD，不会被误动），再用 `--reverse --check --cached` 逐字验证，最后用 `git apply --reverse --cached` 清掉索引里那一份 —— `--cached` 只动索引、只重写补丁命中的 hunk，索引里补丁之外的暂存改动与工作区文件都保持原样。这同时保证了 `stepPatches` 判断「已上游化」的前提成立（它假定未暂存任何东西时索引即 HEAD）；
 - 补丁已被上游吸收时（反向检查通过）会被自动跳过并记为「已上游化」，便于逐步退役补丁；
-- **上游用别的写法修掉同一问题时**，`git apply --3way` 会报冲突并中止（HEAD 已经前进，工作区没有该补丁的改动）。此时该补丁应当退役：把 `NNNN-*.patch` 移出补丁目录即可（例如改名加 `.upstreamed` 后缀，或挪进 `retired/` 子目录 —— 子目录不会被 `listPatchFiles` 读取）。
+- **上游用别的写法修掉同一问题时**，`git apply --3way` 会报冲突。此时插件**先自动恢复**：`git reset --hard <baseCommit>` 回到更新前基线，再重放受管补丁，使工作区与现有构建产物一致（`install`/`build` 尚未运行，**无需重建**），宿主保持可启动；随后把冲突文件逐个列出。修复方式二选一：
+  - 把补丁适配到新上游（推荐，改 `NNNN-*.patch` 内容后重试）；
+  - 若上游已用别的写法修掉同一问题，则退役这个补丁：把 `NNNN-*.patch` 移出补丁目录即可（例如改名加 `.upstreamed` 后缀，或挪进 `retired/` 子目录 —— 子目录不会被 `listPatchFiles` 读取）。
+  > 这条自恢复是为了修掉一个真实事故：旧版只在补丁冲突时中止，导致仓库停在「新上游 + 未构建」——上游若新增了包，其 `lib` 产物不存在，宿主会直接报 `client bundles not found; run pnpm run build` 而无法启动。
 
 ### 手动更新
 
@@ -157,7 +164,7 @@ pnpm dsh web
 
 ### 空闲检查与自重启
 
-面板作为插件运行在**正在服务的宿主进程内**，而本地更新会重链 `node_modules`、重写 `packages/*/lib/*.js`。如果更新期间宿主里有会话正在执行工具调用，运行中的进程随后加载到「换过之后」的模块就会出现同一模块两个实例，破坏服务符号（典型现象：`ctx.tools[TOOL_RUNTIME_SCHEDULER]` 变 `undefined`，工具调用报 `Cannot read properties of undefined (reading 'prepare')`）。因此面板：
+面板作为插件运行在**正在服务的宿主进程内**，而本地更新会重链 `node_modules`、重写 `packages/*/lib/*.js`。构建触发宿主 HMR 后，HMR 会**清掉 Node 的 ESM `loadCache` 并重新 `import()`** 受影响的插件，从而产生同一模块的第二个实例；若键是 `unique symbol`（`Symbol(...)`），两个实例的键就不再相等，`ctx.tools[TOOL_RUNTIME_SCHEDULER]` 随之变 `undefined`，工具调用报 `Cannot read properties of undefined (reading 'prepare')`。这类跨包 `unique symbol` 的脆弱性已在补丁 `dsh-patches/0003` 里改为进程级 `Symbol.for` 根治；面板这一层则尽量减少「运行中做破坏性操作」的窗口：
 
 - **更新前**要求宿主空闲：`ctx.agents.list()` 里有 `status === 'running'` 的会话时拒绝启动更新（HTTP 409），界面上的「一键本地更新」也会置灰并说明原因。确需在运行中更新时，API 可传 `"force": true`。
 - **更新成功后**自动重启宿主：由一个脱离进程的 helper 等宿主端口真正释放后，重放原始启动命令拉起 `dsh web`（Windows 下用隐藏控制台包装，避免替换进程的控制台子进程弹窗）。helper 日志写在系统临时目录（`dsh-version-panel-restart-*.log`），失败会留证。
@@ -358,7 +365,7 @@ dsh plugin --profile web add github:Emily0266/DSH_update
 
 ### 更新完成后界面没变化
 
-需要**重启 `dsh web`**。插件本身不会自动重启宿主进程。
+需要**重启 `dsh web`**。一键更新成功后插件会自动安排宿主重启（见「空闲检查与自重启」）；手动更新、或自重启被禁用时才需要自己重启。
 
 ## 已知限制
 
@@ -371,6 +378,7 @@ dsh plugin --profile web add github:Emily0266/DSH_update
 - **冒烟自检是 best-effort**：临时 `DSH_HOME` 里的 profile 依赖真实 profile 的 `node_modules`；找不到 profile 或无法启动时只记录原因并继续，不阻塞更新。超时按告警处理。
 - **产物校验只查存在性**：构建记录的 SHA-256 摘要逻辑仍由 DSH 自己的构建负责，插件只检查存在性 + `formatVersion === 1`。
 - **版本兼容性**：当前针对 DSH `0.1.5-rc.2` 验证；DSH 客户端 slot 或 `webServer` API 变更可能导致界面不挂载（host 端检查通常仍可用）。
+- **受管补丁会随上游漂移**：上游重构（文件移动、API 改名、等价修复）会让补丁 `git apply --3way` 冲突。插件会**自动恢复**到基线并保证可启动，但补丁本身需要人工适配或退役；补丁说明见 `dsh-patches/README.md`。
 
 ## 开发
 

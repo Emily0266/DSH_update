@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -206,5 +207,43 @@ console.log('HTTP', res.status, '|', JSON.stringify(res.data));
 assert.equal(res.status, 400);
 assert.ok(String(res.data.error).includes('基线提交'));
 assert.equal(__internals.updateRun.running, false, 'rollback guard must not start a run');
+
+/* 13. 回归：补丁改动被 git add（索引里也有一份）时，暂退步骤必须仍然通过 */
+const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+const patchRepo = mkdtempSync(join(tmpdir(), 'dsh-patch-repo-'));
+const patchDir = mkdtempSync(join(tmpdir(), 'dsh-patch-dir-'));
+const patchFile = join(patchDir, '0001-staged-copy.patch');
+process.env.DSH_VERSION_PANEL_PATCH_DIR = patchDir;
+
+git(patchRepo, ['init', '-q', '.']);
+git(patchRepo, ['config', 'core.autocrlf', 'false']);
+git(patchRepo, ['config', 'user.email', 'test@example.com']);
+git(patchRepo, ['config', 'user.name', 'test']);
+const baseLines = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`);
+writeFileSync(join(patchRepo, 'f.txt'), `${baseLines.join('\n')}\n`);
+git(patchRepo, ['add', 'f.txt']);
+git(patchRepo, ['commit', '-qm', 'base']);
+const patchedLines = [...baseLines];
+patchedLines[4] = 'line 5 CHANGED';
+writeFileSync(join(patchRepo, 'f.txt'), `${patchedLines.join('\n')}\n`);
+git(patchRepo, ['diff', `--output=${patchFile}`, '--', 'f.txt']);
+git(patchRepo, ['checkout', '--', 'f.txt']);
+// 模拟用户：应用补丁后又 git add（索引与工作区都带上改动，git status 报 M_）
+git(patchRepo, ['apply', patchFile]);
+git(patchRepo, ['add', 'f.txt']);
+const stageState = git(patchRepo, ['status', '--porcelain']).trim();
+console.log('\n=== retreat step with a staged patch copy (regression: update used to abort) ===');
+console.log('before retreat:', JSON.stringify(stageState));
+assert.equal(stageState.slice(0, 2), 'M ', 'fixture must have the patch staged');
+
+const retreat = await __internals.stepRetreatManagedPatches(patchRepo);
+console.log('retreat status:', retreat.status, '| reverted:', JSON.stringify(retreat.reverted));
+assert.equal(retreat.status, 'ok', `retreat must not abort: ${retreat.error ?? ''}`);
+const afterRetreat = git(patchRepo, ['status', '--porcelain']).trim();
+console.log('after retreat:', JSON.stringify(afterRetreat));
+assert.equal(afterRetreat, '', 'worktree and index must both be clean after retreat');
+assert.equal(git(patchRepo, ['diff', '--cached', '--name-only']).trim(), '', 'index must not keep a copy of the patch');
+rmSync(patchRepo, { recursive: true, force: true });
+rmSync(patchDir, { recursive: true, force: true });
 
 console.log('\nall assertions passed');
