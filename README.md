@@ -32,6 +32,7 @@ DSH 的 Web 界面本身没有版本查看入口，源码部署时更难确认�
 | **空闲检查** | 更新前检查宿主是否有会话正在运行；有则拒绝启动（可用 `force: true` 覆盖）。运行中替换 `node_modules` 与构建产物会让宿主加载到「换过之后」的模块，可能打断正在执行的工具调用 |
 | **自动重启** | 更新成功后由脱离进程的 helper 等宿主端口释放后自动拉起 `dsh web`，避免用户继续使用模块已被替换的进程；在 systemd 监管或调试器下自动禁用（可用 `allowRestart` 覆盖） |
 | **网络不稳定** | 对 `git pull` / `git fetch` 与 `api.github.com` 的瞬时网络错误（`Connection was reset`、`Recv failure`、超时、TLS 等）**自动重试 3 次**并线性退避；提供「**预取上游**」按钮，在联网时先抓一次，之后即使 GitHub 断开也能走离线快进；`HTTPS_PROXY` / `HTTP_PROXY` 会显式以 `-c http.proxy=` 传给 git |
+| **离线更新** | 只要本地 `origin/master` 比当前 HEAD 新且可快进（预取成功过即可，**无需 GitHub 可达**），界面自动出现「**离线更新可用**」卡片与「**立即离线更新**」按钮；点击后跳过联网 pull，直接 `git merge --ff-only origin/master` 完成更新（进度里标注「未与上游重新校验」） |
 | **失败回滚** | 更新失败后可从面板一键回滚到更新前的基线提交：`git reset --hard <base>` → 重放受管补丁 → 重装 → 重建。基线提交持久化在 DSH home，跨宿主重启仍可回滚 |
 | **补丁冲突自恢复** | `git pull` 之后补丁重放冲突时，**自动**把工作区恢复到更新前的基线提交并重放补丁，使工作区与现有构建产物一致（`install`/`build` 尚未运行，无需重建），保证宿主仍可启动；冲突文件逐个列出待修。不会再留下「新上游 + 未构建、起不来」的状态 |
 | **构建前清理** | 构建前先跑 `pnpm run clean`（该脚本缺失时忽略），避免 pull 后的新源码与上一次构建的旧 `lib/` 混杂导致 `MISSING_EXPORT` 之类的构建失败 |
@@ -220,10 +221,10 @@ host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
 | `GET` | — | 读取状态（当前版本 + 上游版本，带缓存）。可加 `?force=1` 跳过缓存 |
 | `POST` | `{ "action": "check" }` | 强制重新检查上游 |
 | `POST` | `{ "action": "progress" }` | 读取更新进度 |
-| `POST` | `{ "action": "update", "confirm": true }` | 启动本地更新（缺少 `confirm` 会被拒绝；宿主有会话运行时返回 409，可加 `"force": true` 覆盖） |
+| `POST` | `{ "action": "update", "confirm": true }` | 启动本地更新（缺少 `confirm` 会被拒绝；宿主有会话运行时返回 409，可加 `"force": true` 覆盖）。加 `"offline": true` 则跳过联网 pull、直接用本地已抓取的 `origin/master` 快进 |
 | `POST` | `{ "action": "restart" }` | 安排宿主自重启（仅接受本机同源请求；监管/调试器/`allowRestart: false` 下返回 409） |
 | `POST` | `{ "action": "rollback", "confirm": true }` | 回滚到最近一次更新的基线提交（可用 `baseCommit` 覆盖）。需 `confirm: true`、仅本机同源、宿主空闲；跨进程锁被占用时返回 409 |
-| `POST` | `{ "action": "prefetch" }` | 预取上游：只 `git fetch --prune origin`、不合并（网络类失败自动重试）。联网时先抓一次，之后即使 GitHub 断开也能离线快进；失败返回 502 带 git 输出 |
+| `POST` | `{ "action": "prefetch" }` | 预取上游：只 `git fetch --prune origin`、不合并（网络类失败自动重试）。联网时先抓一次，之后即使 GitHub 断开也能离线快进；响应带 `canOfflineUpdate`。失败返回 502 带 git 输出 |
 
 `GET` 响应示例：
 
@@ -264,6 +265,11 @@ host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
     "bootCommit": "ddefc45fbc7f8e46dd73185e68295696d1297887",
     "diskCommit": "ddefc45fbc7f8e46dd73185e68295696d1297887",
     "stale": false
+  },
+  "offlineUpdate": {
+    "ready": true,
+    "head": "ddefc45fbc7f8e46dd73185e68295696d1297887",
+    "originMaster": "21638c56315ae6a2b552d6091945d3144c9af32e"
   },
   "lastRun": {
     "kind": "update",

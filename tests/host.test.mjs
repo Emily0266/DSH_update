@@ -257,4 +257,27 @@ assert.equal(git(patchRepo, ['diff', '--cached', '--name-only']).trim(), '', 'in
 rmSync(patchRepo, { recursive: true, force: true });
 rmSync(patchDir, { recursive: true, force: true });
 
+/* 离线可更新判定：「origin/master 领先且 HEAD 是它的祖先」⇒ ready；相等/本地领先/分叉 ⇒ 不 ready。 */
+const offRepo = mkdtempSync(join(tmpdir(), 'dsh-vp-offline-'));
+const gitOff = (...args) => execFileSync('git', ['-C', offRepo, ...args], { encoding: 'utf8' }).trim();
+gitOff('init');
+gitOff('config', 'user.email', 't@t');
+gitOff('config', 'user.name', 't');
+writeFileSync(join(offRepo, 'f.txt'), '1');
+gitOff('add', '.');
+gitOff('commit', '-m', 'c1');
+const offC1 = gitOff('rev-parse', 'HEAD');
+writeFileSync(join(offRepo, 'f.txt'), '2');
+gitOff('add', '.');
+gitOff('commit', '-m', 'c2');
+const offC2 = gitOff('rev-parse', 'HEAD');
+gitOff('update-ref', 'refs/remotes/origin/master', offC1);
+await __internals.invalidateGitCaches?.();
+assert.equal((await __internals.readOfflineReadiness(offRepo)).ready, false, '本地领先不该判为可离线');
+gitOff('reset', '--hard', offC1);
+gitOff('update-ref', 'refs/remotes/origin/master', offC2);
+__internals.invalidateGitCaches();
+assert.equal((await __internals.readOfflineReadiness(offRepo)).ready, true, 'origin 领先且可快进应判为可离线');
+rmSync(offRepo, { recursive: true, force: true });
+
 console.log('\nall assertions passed');
