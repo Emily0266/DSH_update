@@ -31,6 +31,7 @@ DSH 的 Web 界面本身没有版本查看入口，源码部署时更难确认�
 | **本地更新** | 仅对 git 源码仓库开放，按 `preflight` → 暂退受管补丁 → `git pull --ff-only` → 重放受管补丁 → `corepack pnpm install` → `corepack pnpm run clean` → `corepack pnpm run build` → 产物校验 → 隔离冒烟自检 顺序执行，**分步实时进度** |
 | **空闲检查** | 更新前检查宿主是否有会话正在运行；有则拒绝启动（可用 `force: true` 覆盖）。运行中替换 `node_modules` 与构建产物会让宿主加载到「换过之后」的模块，可能打断正在执行的工具调用 |
 | **自动重启** | 更新成功后由脱离进程的 helper 等宿主端口释放后自动拉起 `dsh web`，避免用户继续使用模块已被替换的进程；在 systemd 监管或调试器下自动禁用（可用 `allowRestart` 覆盖） |
+| **网络不稳定** | 对 `git pull` / `git fetch` 与 `api.github.com` 的瞬时网络错误（`Connection was reset`、`Recv failure`、超时、TLS 等）**自动重试 3 次**并线性退避；提供「**预取上游**」按钮，在联网时先抓一次，之后即使 GitHub 断开也能走离线快进；`HTTPS_PROXY` / `HTTP_PROXY` 会显式以 `-c http.proxy=` 传给 git |
 | **失败回滚** | 更新失败后可从面板一键回滚到更新前的基线提交：`git reset --hard <base>` → 重放受管补丁 → 重装 → 重建。基线提交持久化在 DSH home，跨宿主重启仍可回滚 |
 | **补丁冲突自恢复** | `git pull` 之后补丁重放冲突时，**自动**把工作区恢复到更新前的基线提交并重放补丁，使工作区与现有构建产物一致（`install`/`build` 尚未运行，无需重建），保证宿主仍可启动；冲突文件逐个列出待修。不会再留下「新上游 + 未构建、起不来」的状态 |
 | **构建前清理** | 构建前先跑 `pnpm run clean`（该脚本缺失时忽略），避免 pull 后的新源码与上一次构建的旧 `lib/` 混杂导致 `MISSING_EXPORT` 之类的构建失败 |
@@ -222,6 +223,7 @@ host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
 | `POST` | `{ "action": "update", "confirm": true }` | 启动本地更新（缺少 `confirm` 会被拒绝；宿主有会话运行时返回 409，可加 `"force": true` 覆盖） |
 | `POST` | `{ "action": "restart" }` | 安排宿主自重启（仅接受本机同源请求；监管/调试器/`allowRestart: false` 下返回 409） |
 | `POST` | `{ "action": "rollback", "confirm": true }` | 回滚到最近一次更新的基线提交（可用 `baseCommit` 覆盖）。需 `confirm: true`、仅本机同源、宿主空闲；跨进程锁被占用时返回 409 |
+| `POST` | `{ "action": "prefetch" }` | 预取上游：只 `git fetch --prune origin`、不合并（网络类失败自动重试）。联网时先抓一次，之后即使 GitHub 断开也能离线快进；失败返回 502 带 git 输出 |
 
 `GET` 响应示例：
 
@@ -325,12 +327,12 @@ host 端在 `ctx.webServer` 上注册精确路由 `/dsh-version/api`：
 
 ### 上游检查失败 / 最新版本显示为空
 
-多为网络问题。该插件请求 `api.github.com`。若所在网络阻断 GitHub：
+该插件请求 `api.github.com`；对瞬时网络错误与 5xx 会**自动重试最多 3 次**（线性退避），仍失败才报错。若持续失败：
 
 - 为 DSH 进程配置代理（`HTTPS_PROXY`），或
 - 让代理软件接管系统流量。
 
-字段「检查来源」与「上游检查提示」会给出本次失败原因。
+字段「检查来源」与「上游检查提示」会给出本次失败原因；最近一次成功结果会缓存 5 分钟。
 
 ### 安装时 `git` 连不上 GitHub
 
@@ -350,12 +352,15 @@ dsh plugin --profile web add github:Emily0266/DSH_update
 
 ### 本地更新报「unable to access 'https://github.com/...' / Connection was reset」
 
-`git pull` 的第一步是 fetch，GitHub 不可达时它就先失败了。插件对此的处理：
+`git pull` 的第一步是 fetch，GitHub 抖动时它可能先失败。插件对此的处理（按顺序）：
 
-- **本地已经 fetch 到更新的 `origin/master`**（上一次拉取成功过）⇒ 自动改用**离线快进**（`git merge --ff-only origin/master`），更新继续走完 install/build，并在进度卡片与 `offlineFallback` 字段上标注「本次没和上游重新校验，可能不是此刻的最新提交」；
-- **本地没有可快进的目标** ⇒ 中止更新，工作区（含暂退的补丁）保持更新前的样子，不会留下半成品。
+1. **自动重试**：识别为「网络类」失败（`Connection was reset` / `Recv failure` / `Could not resolve host` / 超时 / TLS 等）时，自动重试最多 3 次并线性退避（1.5s / 3s）；git 逻辑错误（非快进等）不重试。
+2. **离线快进兜底**：本地已有更新的 `origin/master`（上一次 fetch 成功过）⇒ 用 `git merge --ff-only origin/master` 把更新走完，并在进度卡片与 `offlineFallback` 字段标注「本次没和上游重新校验，可能不是此刻的最新提交」。
+3. **都没有** ⇒ 中止更新，工作区（含暂退的补丁）保持更新前样子，不会留下半成品。
 
-想彻底解决就恢复 GitHub 可达性（配置 `http.proxy` / 开代理），然后重开一次更新；`git fetch` 成功过一次后，即使随后 GitHub 又断，也能靠离线快进完成。
+**不稳定网络下的建议**：在**能连上 GitHub 的那一刻**点一次「**预取上游**」（只做 `git fetch --prune origin`、不合并，网络类失败同样自动重试）。预取成功后，哪怕之后 GitHub 又断，第 2 步的离线快进也能把更新走完。
+
+代理：`git` 默认不读 Windows 系统代理。设 `HTTPS_PROXY`，或 `git config --global http.proxy http://127.0.0.1:<端口>`；插件会把 `HTTPS_PROXY`/`HTTP_PROXY` 显式以 `-c http.proxy=` 传给 git。
 
 > 不要用 `gitclone.com` 这类镜像当上游：实测它的 `master` 仍停在 `dsh-0.1.2-alpha.4`，比真实上游落后很多。镜像只适合加速首次克隆。
 

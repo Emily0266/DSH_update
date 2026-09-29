@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,17 @@ import { join } from 'node:path';
 process.argv[1] = 'D:\\deepseek-harness\\apps\\cli\\src\\bin.ts';
 // 把状态文件写进临时 DSH_HOME，避免污染真实 home。
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-version-panel-test-'));
+
+/* 静态守卫：块注释里若混入「星号紧跟斜杠」的闭合标记（例如把一个含星号的路径写进注释），
+   会提前闭合注释，把后面的词（如 lib）变成真实代码 → 运行期 ReferenceError。曾导致回滚报
+   "lib is not defined"，而 node --check 只查语法抓不到。任何行出现两个以上闭合标记即失败。 */
+for (const rel of ['../lib/index.js', '../lib/client.js']) {
+  const text = readFileSync(new URL(rel, import.meta.url), 'utf8');
+  text.split('\n').forEach((line, index) => {
+    const ends = (line.match(/\*\//g) ?? []).length;
+    assert.ok(ends <= 1, `${rel}:${index + 1} 一行出现 ${ends} 个 "*/"（疑似块注释提前闭合）：${line.trim()}`);
+  });
+}
 
 // 上游检查打桩，避免测试依赖真实网络。
 globalThis.fetch = async (url) => {
