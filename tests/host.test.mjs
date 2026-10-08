@@ -161,11 +161,14 @@ assert.equal(__internals.servingPort({ headers: { host: '127.0.0.1:3080' } }), 3
 assert.equal(__internals.servingPort({ headers: { host: '127.0.0.1' } }), null);
 
 /* 8. 启动命令重建 + helper 源码可编译 */
+process.argv[2] = 'web'; // 模拟 `dsh web`：重放启动命令时必须带上 profile 参数
 const launch = __internals.dshLaunch();
 assert.equal(launch.viaShell, false);
 assert.ok(launch.args.some((argument) => String(argument).endsWith('bin.ts')), 'launch must replay the node entry');
+// 回归：漏掉 argv.slice(2) 会让重放出的宿主报 `--profile <name> is required`，更新成功后服务起不来。
+assert.ok(launch.args.includes('web'), 'launch must replay the app args (web)');
 const helper = __internals.restartHelperSource(
-  { file: 'node', args: [], viaShell: false, detached: true },
+  { file: 'node', args: launch.args, viaShell: false, detached: true },
   { cwd: 'C:\\tmp' },
   { out: 'o.log', err: 'e.log' },
   3080,
@@ -173,6 +176,7 @@ const helper = __internals.restartHelperSource(
 // 只编译不执行（body 末尾的 main() 需要显式调用才会跑）。
 new Function('require', helper);
 assert.ok(helper.includes('const port = 3080'));
+assert.ok(helper.includes('"web"'), 'helper must carry the app args');
 
 /* 9. P2：宿主身份（运行 vs 磁盘） */
 const repoRoot = state.data.repoRoot;
